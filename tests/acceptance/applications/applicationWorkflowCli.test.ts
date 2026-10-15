@@ -18,6 +18,7 @@ import {
   SOURCE_TO_BUNDLE_COMPARISON_EXAMPLE,
 } from "../../../src/contracts/javascript/javascriptApplicationWorkflowExamples.js";
 import { analyzeJavaScriptApplication } from "../../support/javascriptApplicationScope.js";
+import { parseEvidence } from "../../../src/domain/evidence.js";
 import {
   javascriptApplicationAnalysisResultSchema,
   type JavaScriptApplicationAnalysisResult,
@@ -484,6 +485,7 @@ it("preserves complete line-comment source-map URLs through CLI and MCP", async 
           declared_url: declaredUrl,
           declared_url_sha256: digest,
           resolved_path: "app.js.map",
+          resolution_status: "resolved",
           available: true,
         },
         evidence: expect.objectContaining({
@@ -506,6 +508,7 @@ it("preserves complete line-comment source-map URLs through CLI and MCP", async 
         properties: {
           declared_url_sha256: digest,
           resolved_path: "app.js.map",
+          resolution_status: "resolved",
         },
       }),
     );
@@ -538,7 +541,7 @@ it("resolves source-map URL paths once without changing their declarations", asy
   await writeFile(
     join(root, "app.js"),
     cases.map(([url]) => `//# sourceMappingURL=${url}\n`).join("") +
-      'new Worker("./worker%20file.js");\n' +
+      'new Worker(new URL("./worker%20file.js", import.meta.url));\n' +
       'navigator.serviceWorker.register("./service%20worker.js");\n',
   );
   await writeFile(join(root, "worker file.js"), "export const worker = 1;\n");
@@ -564,6 +567,7 @@ it("resolves source-map URL paths once without changing their declarations", asy
           declared_url: declaredUrl,
           declared_url_sha256: digest,
           resolved_path: path,
+          resolution_status: "resolved",
           available: true,
         },
         evidence: expect.objectContaining({
@@ -586,31 +590,49 @@ it("resolves source-map URL paths once without changing their declarations", asy
       expect.objectContaining({
         relation: "maps_to",
         target_node_id: map?.node_id,
-        properties: { declared_url_sha256: digest, resolved_path: path },
-      }),
-    );
-  }
-  for (const [kind, specifier, path] of [
-    ["worker", "./worker%20file.js", "worker file.js"],
-    ["service-worker", "./service%20worker.js", "service worker.js"],
-  ]) {
-    const worker = graph.nodes.find((node) => node.kind === kind);
-    expect(worker?.observations).toContainEqual(
-      expect.objectContaining({
-        properties: expect.objectContaining({
-          declared_specifier: specifier,
+        properties: {
+          declared_url_sha256: digest,
           resolved_path: path,
-        }),
-      }),
-    );
-    expect(graph.edges).toContainEqual(
-      expect.objectContaining({
-        source_node_id: worker?.node_id,
-        relation: "maps_to",
-        properties: { resolved_path: path },
+          resolution_status: "resolved",
+        },
       }),
     );
   }
+  const worker = graph.nodes.find((node) => node.kind === "worker");
+  expect(worker?.observations).toContainEqual(
+    expect.objectContaining({
+      properties: expect.objectContaining({
+        declared_specifier: "./worker%20file.js",
+        resolved_path: "worker file.js",
+      }),
+    }),
+  );
+  expect(graph.edges).toContainEqual(
+    expect.objectContaining({
+      source_node_id: worker?.node_id,
+      relation: "maps_to",
+      properties: { resolved_path: "worker file.js" },
+    }),
+  );
+  // A service worker script URL is relative to the unestablished document base.
+  const serviceWorker = graph.nodes.find(
+    (node) => node.kind === "service-worker",
+  );
+  expect(serviceWorker?.observations).toContainEqual(
+    expect.objectContaining({
+      properties: expect.objectContaining({
+        declared_specifier: null,
+        expression: 'navigator.serviceWorker.register("./service%20worker.js")',
+        resolved_path: null,
+      }),
+    }),
+  );
+  expect(
+    graph.edges.some(
+      ({ source_node_id, relation }) =>
+        source_node_id === serviceWorker?.node_id && relation === "maps_to",
+    ),
+  ).toBe(false);
   expect((await analyzeThroughStdioMcp(root)).graph).toEqual(graph);
 }, 20_000);
 
@@ -872,8 +894,9 @@ describe("rest parameter semantic trace CLI", () => {
           kind === "expression" && label === `argument ${String(index)}`,
       );
       if (argument === undefined) throw new Error("Missing argument node");
-      const traced = await runCli([
-        "trace-javascript-semantics",
+      const requestPath = join(root, `trace-request-${index}.json`);
+      await writeFile(
+        requestPath,
         JSON.stringify({
           application,
           query: {
@@ -883,6 +906,10 @@ describe("rest parameter semantic trace CLI", () => {
             expected: { role: "sink", classes: ["parameter"] },
           },
         }),
+      );
+      const traced = await runCli([
+        "trace-javascript-semantics",
+        requestPath,
         "--json",
       ]);
       expect(traced).toMatchObject({
@@ -1529,6 +1556,63 @@ const analyzeComparisonSources = async (
     ),
   );
 };
+
+it("retains bundled isolated-world contextBridge APIs through dedicated and generic CLI routes", async () => {
+  const root = await createTestTempDirectory(
+    "rea-context-bridge-isolated-cli-",
+  );
+  await writeFile(
+    join(root, "preload.js"),
+    `(() => {
+      const modules = {
+        2(module) { module.exports = require("electron"); },
+        5(module, exports, load) {
+          const electron = load(2);
+          electron.contextBridge.exposeInIsolatedWorld(1001, "isolatedApi", { ping: true });
+        },
+      };
+      function load(id) {
+        const module = { exports: {} };
+        modules[id].call(module.exports, module, module.exports, load);
+        return module.exports;
+      }
+      load(5);
+    })();`,
+  );
+
+  for (const arguments_ of [
+    ["analyze-javascript-application", root, "--json"],
+    ["analyze", root, "--format", "json"],
+  ]) {
+    const result = javascriptApplicationAnalysisResultSchema.parse(
+      parseEvidence(await runCli(arguments_)).normalized_result,
+    );
+    expect(result.summary.context_bridge_apis).toBe(1);
+    const bridge = result.graph.nodes.find(
+      ({ kind }) => kind === "context-bridge-api",
+    );
+    expect(bridge?.observations).toContainEqual(
+      expect.objectContaining({
+        properties: expect.objectContaining({
+          world: "isolated",
+          world_id: { status: "literal", value: 1001, expression: null },
+          api_key: "isolatedApi",
+          api_status: "object-literal",
+          members: ["ping"],
+          unknown_members: 0,
+          // The proven Webpack bootstrap resolves `load(2)` directly.
+          resolution_basis: "direct-syntax",
+        }),
+        evidence: expect.objectContaining({
+          location: expect.objectContaining({
+            available: true,
+            value: expect.objectContaining({ source: "preload.js" }),
+          }),
+        }),
+      }),
+    );
+  }
+});
 
 const runCli = async (
   arguments_: readonly string[],

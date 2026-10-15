@@ -6,9 +6,15 @@ import type { OwnedStagedOutput } from "../filesystem/OwnedStagedOutput.js";
 import type { ArtifactReader } from "./ArtifactReader.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import type { SafeOutputTree } from "./SafeOutputTree.js";
+import type { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 
-/** One artifact resource and its format-specific cleanup owner. */
+/** One artifact resource and the capability that owns its cleanup. */
 export type ArtifactResourceOwner =
+  | {
+      readonly kind: "lease";
+      readonly resource: string;
+      readonly lease: { release(): Promise<void> };
+    }
   | {
       readonly kind: "javascript-source-analysis";
       readonly resource: string;
@@ -38,6 +44,11 @@ export type ArtifactResourceOwner =
       readonly kind: "staged-output";
       readonly resource: string;
       readonly output: OwnedStagedOutput;
+    }
+  | {
+      readonly kind: "private-runtime-root";
+      readonly resource: string;
+      readonly root: Pick<PrivateRuntimeRoot, "path" | "close">;
     };
 
 export type ArtifactCleanupAttempt =
@@ -50,6 +61,10 @@ export class ArtifactResourceScope {
   readonly #active = new Set<Promise<unknown>>();
   #draining: Promise<void> | undefined;
   #closed = false;
+
+  get hasPending(): boolean {
+    return this.#pending.size > 0;
+  }
 
   /** Admit a resource operation while the scope remains open. */
   async run<T>(operation: () => Promise<T>): Promise<T> {
@@ -146,6 +161,9 @@ export class ArtifactResourceScope {
 
 const cleanup = async (owner: ArtifactResourceOwner): Promise<void> => {
   switch (owner.kind) {
+    case "lease":
+      await owner.lease.release();
+      return;
     case "javascript-source-analysis":
       await owner.analysis.close();
       return;
@@ -161,5 +179,8 @@ const cleanup = async (owner: ArtifactResourceOwner): Promise<void> => {
       return;
     case "staged-output":
       await owner.output.close();
+      return;
+    case "private-runtime-root":
+      await owner.root.close();
   }
 };

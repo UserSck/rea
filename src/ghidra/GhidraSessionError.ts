@@ -2,11 +2,17 @@ import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { DarwinProcessOwnershipInspectionError } from "../process/DarwinProcessRunTokenReader.js";
 import { boundedUtf8Text } from "../process/boundedUtf8Text.js";
+import { GhidraLaunchSupportError } from "./GhidraJavaLaunch.js";
+import {
+  GhidraLaunchError,
+  GHIDRA_LAUNCH_COMMAND_OUTPUT_BYTES,
+} from "./GhidraLauncher.js";
 
 const MAX_CAUSE_DEPTH = 3;
 const MAX_CAUSE_MESSAGE_BYTES = 2 * 1024;
 const MAX_CAUSE_FIELD_BYTES = 1024;
 const MAX_COMPILER_STDERR_BYTES = 8 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES = 8 * 1024;
 
 /** Stable failure phase for one private Ghidra headless session. */
 export type GhidraSessionFailureKind =
@@ -55,7 +61,7 @@ const createGhidraSessionError = (failure: {
   readonly cause?: unknown;
   readonly timeoutMs?: number;
   readonly remoteCode?: string;
-  readonly redact: (value: string) => string;
+  readonly redact: (value: string, incomplete?: boolean) => string;
 }): GhidraSessionError =>
   new GhidraSessionError(
     failure.kind,
@@ -86,7 +92,7 @@ const createGhidraSessionError = (failure: {
 export const bindGhidraSessionFailure =
   (
     diagnostics: () => Readonly<Record<string, JsonValue>>,
-    redact: (value: string) => string = (value) => value,
+    redact: (value: string, incomplete?: boolean) => string = (value) => value,
   ) =>
   (
     kind: GhidraSessionFailureKind,
@@ -110,7 +116,7 @@ export const bindGhidraSessionFailure =
 
 const describeCause = (
   cause: unknown,
-  redact: (value: string) => string,
+  redact: (value: string, incomplete?: boolean) => string,
   depth = 0,
 ): JsonValue => {
   if (cause instanceof Error) {
@@ -133,7 +139,7 @@ const describeCause = (
 
 const describeErrorCause = (
   cause: Error,
-  redact: (value: string) => string,
+  redact: (value: string, incomplete?: boolean) => string,
   depth: number,
 ): JsonValue => {
   const message = boundedUtf8Text(
@@ -148,14 +154,45 @@ const describeErrorCause = (
     ...(message.truncated ? { message_truncated: true } : {}),
     ...causeCode(cause, redact),
     ...causeSignal(cause, redact),
+    ...causeCommandOutcome(cause, redact),
     ...causeCompilerOutcome(cause, redact),
+    ...causeLaunchOutcome(cause, redact),
     ...nestedErrorCause(cause, redact, depth),
+  };
+};
+
+const causeCommandOutcome = (
+  cause: Error,
+  redact: (value: string, incomplete?: boolean) => string,
+): Record<string, JsonValue> => {
+  if (!(cause instanceof GhidraLaunchSupportError)) return {};
+  const outcome = cause.outcome;
+  if (outcome === undefined) return {};
+  const stdout = boundedUtf8Text(
+    redact(outcome.stdout, outcome.outputTruncated !== false),
+    MAX_COMMAND_OUTPUT_BYTES,
+  );
+  const stderr = boundedUtf8Text(
+    redact(outcome.stderr, outcome.outputTruncated !== false),
+    MAX_COMMAND_OUTPUT_BYTES,
+  );
+  return {
+    command_outcome: {
+      stdout: stdout.text,
+      stderr: stderr.text,
+      stdoutBytes: outcome.stdoutBytes ?? Buffer.byteLength(outcome.stdout),
+      stderrBytes: outcome.stderrBytes ?? Buffer.byteLength(outcome.stderr),
+      stdoutTruncated: stdout.truncated,
+      stderrTruncated: stderr.truncated,
+      outputTruncated: outcome.outputTruncated,
+      killed: outcome.killed,
+    },
   };
 };
 
 const causeCode = (
   cause: Error,
-  redact: (value: string) => string,
+  redact: (value: string, incomplete?: boolean) => string,
 ): Record<string, JsonValue> => {
   const code = "code" in cause ? cause.code : undefined;
   if (typeof code === "string") {
@@ -171,7 +208,7 @@ const causeCode = (
 
 const causeSignal = (
   cause: Error,
-  redact: (value: string) => string,
+  redact: (value: string, incomplete?: boolean) => string,
 ): Record<string, JsonValue> => {
   const signal = "signal" in cause ? cause.signal : undefined;
   if (typeof signal === "string") {
@@ -187,7 +224,7 @@ const causeSignal = (
 
 const causeCompilerOutcome = (
   cause: Error,
-  redact: (value: string) => string,
+  redact: (value: string, incomplete?: boolean) => string,
 ): Record<string, JsonValue> => {
   if (!(cause instanceof DarwinProcessOwnershipInspectionError)) return {};
   const outcome = cause.compilerOutcome;
@@ -213,16 +250,65 @@ const causeCompilerOutcome = (
 
 const boundedCompilerField = (
   value: string | number | null,
-  redact: (value: string) => string,
+  redact: (value: string, incomplete?: boolean) => string,
 ): { readonly value: string | number | null; readonly truncated: boolean } => {
   if (typeof value !== "string") return { value, truncated: false };
   const bounded = boundedUtf8Text(redact(value), MAX_CAUSE_FIELD_BYTES);
   return { value: bounded.text, truncated: bounded.truncated };
 };
 
+/** Retain a launch failure's launcher command outcome in its cause envelope. */
+const causeLaunchOutcome = (
+  cause: Error,
+  redact: (value: string, incomplete?: boolean) => string,
+): Record<string, JsonValue> => {
+  if (!(cause instanceof GhidraLaunchError)) return {};
+  const launchSupport =
+    cause.launchSupport.length === 0
+      ? {}
+      : {
+          launch_support: cause.launchSupport.map((output) => ({
+            ...output,
+            stderr: redact(output.stderr),
+          })),
+        };
+  // A failed LaunchSupport helper reports its own command outcome in the
+  // nested cause; earlier helper warnings still belong to this launch.
+  if (cause.cause instanceof GhidraLaunchSupportError) return launchSupport;
+  const output = cause.capturedOutput;
+  if (output === undefined) return launchSupport;
+  const stdout = boundedUtf8Text(
+    redact(output.stdout),
+    GHIDRA_LAUNCH_COMMAND_OUTPUT_BYTES,
+  );
+  const stderr = boundedUtf8Text(
+    redact(output.stderr),
+    GHIDRA_LAUNCH_COMMAND_OUTPUT_BYTES,
+  );
+  const truncated = output.truncated || stdout.truncated || stderr.truncated;
+  return {
+    ...launchSupport,
+    launch_outcome: {
+      stdout: stdout.text,
+      stderr: stderr.text,
+      truncated,
+      ...(truncated
+        ? {
+            stdout_bytes: Buffer.byteLength(output.stdout),
+            stderr_bytes: Buffer.byteLength(output.stderr),
+          }
+        : {}),
+      ...(output.exit_code === undefined
+        ? {}
+        : { exit_code: output.exit_code }),
+      ...(output.signal === undefined ? {} : { signal: output.signal }),
+    },
+  };
+};
+
 const nestedErrorCause = (
   cause: Error,
-  redact: (value: string) => string,
+  redact: (value: string, incomplete?: boolean) => string,
   depth: number,
 ): Record<string, JsonValue> => {
   if (!("cause" in cause)) return {};
